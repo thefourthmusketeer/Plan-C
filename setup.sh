@@ -14,9 +14,8 @@
 #   7. Upsert the VLESS/WS/TLS inbound in x-ui via SQLite
 #   8. Print the final VLESS URI
 #
-# Dependencies:
-#   aws cli v2, curl, jq
-#   (all standard on Ubuntu; install with: apt install -y curl jq unzip)
+# Dependencies (auto-installed if missing):
+#   aws cli v2, curl, jq, unzip
 #
 # Usage:
 #   cp .env.example .env   # fill in values
@@ -67,9 +66,30 @@ VLESS_UUID="${VLESS_UUID:-}"
 
 # ─── dependency checks ────────────────────────────────────────────────────────
 header "Checking dependencies"
-for cmd in aws curl jq; do
-  command -v "$cmd" &>/dev/null && ok "$cmd found" || die "$cmd is required — apt install -y curl jq unzip"
+
+MISSING_APT=()
+for cmd in curl jq; do
+  command -v "$cmd" &>/dev/null && ok "$cmd found" || MISSING_APT+=("$cmd")
 done
+
+if [[ ${#MISSING_APT[@]} -gt 0 ]]; then
+  info "Installing missing apt packages: ${MISSING_APT[*]}"
+  apt update -qq && apt install -y "${MISSING_APT[@]}" || die "Failed to install ${MISSING_APT[*]}"
+  ok "Installed: ${MISSING_APT[*]}"
+fi
+
+command -v unzip &>/dev/null || { info "unzip not found — installing"; apt install -y unzip; }
+
+if command -v aws &>/dev/null; then
+  ok "aws found"
+else
+  info "AWS CLI not found — downloading and installing..."
+  curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp/ || die "Failed to unzip AWS CLI"
+  /tmp/aws/install --update || die "AWS CLI install failed"
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+  ok "AWS CLI installed"
+fi
 
 AWS_IDENTITY=$(aws sts get-caller-identity 2>/dev/null) \
   || die "AWS credentials not configured — run 'aws configure'"

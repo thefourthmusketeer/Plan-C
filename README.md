@@ -10,7 +10,7 @@ Run `setup.sh` directly on the VPS to do everything automatically, or follow the
 - Domain managed in Cloudflare
 - AWS account with CLI configured (`aws configure`) — run on the VPS
 - VPS on a non-blocked IP range (avoid Hetzner Helsinki, OVH, etc.)
-- Dependencies: `apt install -y curl jq unzip`
+- Dependencies handled automatically by `setup.sh` (curl, jq, unzip, AWS CLI)
 
 ---
 
