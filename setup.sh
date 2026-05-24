@@ -106,7 +106,7 @@ for url in \
   "https://ifconfig.me/ip" \
   "https://icanhazip.com"
 do
-  VPS_IP=$(curl -sf --max-time 5 "$url" | tr -d '[:space:]') && [[ -n "$VPS_IP" ]] && break
+  VPS_IP=$(curl -s --max-time 5 "$url" | tr -d '[:space:]') && [[ -n "$VPS_IP" ]] && break
 done
 
 [[ -n "$VPS_IP" ]] || die "Could not detect public IP — set VPS_IP manually in .env"
@@ -129,17 +129,17 @@ header "Step 2 — Cloudflare DNS: root A record"
 CF_API="https://api.cloudflare.com/client/v4"
 CF_HDR=(-H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
 
-EXISTING_A=$(curl -sf "${CF_API}/zones/${CF_ZONE_ID}/dns_records?type=A&name=${ROOT_DOMAIN}" \
+EXISTING_A=$(curl -s "${CF_API}/zones/${CF_ZONE_ID}/dns_records?type=A&name=${ROOT_DOMAIN}" \
   "${CF_HDR[@]}" | jq -r '.result[0].id // empty')
 
 if [[ -n "$EXISTING_A" ]]; then
-  RESP=$(curl -sf -X PUT "${CF_API}/zones/${CF_ZONE_ID}/dns_records/${EXISTING_A}" \
+  RESP=$(curl -s -X PUT "${CF_API}/zones/${CF_ZONE_ID}/dns_records/${EXISTING_A}" \
     "${CF_HDR[@]}" \
     -d "{\"type\":\"A\",\"name\":\"${ROOT_DOMAIN}\",\"content\":\"${VPS_IP}\",\"ttl\":60,\"proxied\":false}")
   echo "$RESP" | jq -e '.success' >/dev/null || die "Failed to update A record: $RESP"
   ok "Updated A record: ${ROOT_DOMAIN} → ${VPS_IP} (not proxied)"
 else
-  RESP=$(curl -sf -X POST "${CF_API}/zones/${CF_ZONE_ID}/dns_records" \
+  RESP=$(curl -s -X POST "${CF_API}/zones/${CF_ZONE_ID}/dns_records" \
     "${CF_HDR[@]}" \
     -d "{\"type\":\"A\",\"name\":\"${ROOT_DOMAIN}\",\"content\":\"${VPS_IP}\",\"ttl\":60,\"proxied\":false}")
   echo "$RESP" | jq -e '.success' >/dev/null || die "Failed to create A record: $RESP"
@@ -191,13 +191,13 @@ info "ACM validation record: ${VAL_NAME} CNAME → ${VAL_VALUE}"
 
 VAL_NAME_SHORT="${VAL_NAME%.}"
 
-EXISTING_VAL=$(curl -sf "${CF_API}/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${VAL_NAME_SHORT}" \
+EXISTING_VAL=$(curl -s "${CF_API}/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${VAL_NAME_SHORT}" \
   "${CF_HDR[@]}" | jq -r '.result[0].id // empty')
 
 if [[ -n "$EXISTING_VAL" ]]; then
   ok "ACM validation CNAME already exists in Cloudflare"
 else
-  RESP=$(curl -sf -X POST "${CF_API}/zones/${CF_ZONE_ID}/dns_records" \
+  RESP=$(curl -s -X POST "${CF_API}/zones/${CF_ZONE_ID}/dns_records" \
     "${CF_HDR[@]}" \
     -d "{\"type\":\"CNAME\",\"name\":\"${VAL_NAME_SHORT}\",\"content\":\"${VAL_VALUE}\",\"ttl\":60,\"proxied\":false}")
   echo "$RESP" | jq -e '.success' >/dev/null || die "Failed to create ACM validation CNAME: $RESP"
@@ -323,17 +323,17 @@ fi
 # ─── Step 5: Cloudflare CNAME cdn → CloudFront ───────────────────────────────
 header "Step 5 — Cloudflare CNAME: ${CDN_DOMAIN} → ${CF_DIST_DOMAIN}"
 
-EXISTING_CDN=$(curl -sf "${CF_API}/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${CDN_DOMAIN}" \
+EXISTING_CDN=$(curl -s "${CF_API}/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${CDN_DOMAIN}" \
   "${CF_HDR[@]}" | jq -r '.result[0].id // empty')
 
 if [[ -n "$EXISTING_CDN" ]]; then
-  RESP=$(curl -sf -X PUT "${CF_API}/zones/${CF_ZONE_ID}/dns_records/${EXISTING_CDN}" \
+  RESP=$(curl -s -X PUT "${CF_API}/zones/${CF_ZONE_ID}/dns_records/${EXISTING_CDN}" \
     "${CF_HDR[@]}" \
     -d "{\"type\":\"CNAME\",\"name\":\"${CDN_DOMAIN}\",\"content\":\"${CF_DIST_DOMAIN}\",\"ttl\":60,\"proxied\":false}")
   echo "$RESP" | jq -e '.success' >/dev/null || die "Failed to update CDN CNAME: $RESP"
   ok "Updated CNAME: ${CDN_DOMAIN} → ${CF_DIST_DOMAIN}"
 else
-  RESP=$(curl -sf -X POST "${CF_API}/zones/${CF_ZONE_ID}/dns_records" \
+  RESP=$(curl -s -X POST "${CF_API}/zones/${CF_ZONE_ID}/dns_records" \
     "${CF_HDR[@]}" \
     -d "{\"type\":\"CNAME\",\"name\":\"${CDN_DOMAIN}\",\"content\":\"${CF_DIST_DOMAIN}\",\"ttl\":60,\"proxied\":false}")
   echo "$RESP" | jq -e '.success' >/dev/null || die "Failed to create CDN CNAME: $RESP"
