@@ -127,28 +127,51 @@ Create a VLESS inbound with these settings:
 **ALPN must be `http/1.1` only.** Adding `h2` causes CloudFront and xray to negotiate HTTP/2,
 which does not support WebSocket upgrades.
 
-To create the inbound directly via SQLite (if the panel HTTP API is unavailable):
+To add the inbound via the 3x-ui panel, go to **Inbounds → Add** and paste this JSON (replace `yourdomain.com` and the UUID):
 
-```bash
-# Generate a UUID
-UUID=$(/usr/local/x-ui/bin/xray uuid)
-
-sqlite3 /etc/x-ui/x-ui.db "
-INSERT INTO inbounds
-  (user_id, up, down, total, all_time, remark, enable, expiry_time,
-   traffic_reset, last_traffic_reset_time, listen, port, protocol,
-   settings, stream_settings, tag, sniffing)
-VALUES (
-  1, 0, 0, 0, 0, 'vless-ws-tls-cf', 1, 0, 'never', 0,
-  '0.0.0.0', 443, 'vless',
-  '{\"clients\":[{\"comment\":\"\",\"created_at\":0,\"email\":\"user\",\"enable\":true,\"expiryTime\":0,\"flow\":\"\",\"id\":\"'$UUID'\",\"limitIp\":0,\"reset\":0,\"subId\":\"\",\"tgId\":0,\"totalGB\":0,\"updated_at\":0}],\"decryption\":\"none\",\"encryption\":\"none\"}',
-  '{\"network\":\"ws\",\"security\":\"tls\",\"externalProxy\":[],\"tlsSettings\":{\"serverName\":\"cdn.yourdomain.com\",\"minVersion\":\"1.2\",\"maxVersion\":\"1.3\",\"cipherSuites\":\"\",\"rejectUnknownSni\":false,\"disableSystemRoot\":false,\"enableSessionResumption\":false,\"certificates\":[{\"certificateFile\":\"/root/cert/domain/fullchain.pem\",\"keyFile\":\"/root/cert/domain/privkey.pem\",\"oneTimeLoading\":false,\"usage\":\"encipherment\",\"buildChain\":false}],\"alpn\":[\"http/1.1\"],\"echServerKeys\":\"\",\"echForceQuery\":\"none\",\"settings\":{\"fingerprint\":\"random\",\"echConfigList\":\"\"}}',\"wsSettings\":{\"acceptProxyProtocol\":false,\"path\":\"/api/v1/chat\",\"host\":\"\",\"headers\":{},\"heartbeatPeriod\":0}}',
-  'inbound-443',
-  '{\"enabled\":false,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}'
-);"
-
-systemctl restart x-ui
+```json
+{
+  "remark": "vless-ws-tls-cf",
+  "port": 443,
+  "protocol": "vless",
+  "settings": {
+    "clients": [{
+      "id": "<generate-a-uuid>",
+      "email": "user",
+      "enable": true,
+      "flow": "",
+      "limitIp": 0,
+      "totalGB": 0,
+      "expiryTime": 0
+    }],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "ws",
+    "security": "tls",
+    "tlsSettings": {
+      "serverName": "cdn.yourdomain.com",
+      "alpn": ["http/1.1"],
+      "minVersion": "1.2",
+      "maxVersion": "1.3",
+      "certificates": [{
+        "certificateFile": "/root/cert/domain/fullchain.pem",
+        "keyFile": "/root/cert/domain/privkey.pem"
+      }]
+    },
+    "wsSettings": {
+      "path": "/api/v1/chat",
+      "headers": {}
+    }
+  },
+  "sniffing": {
+    "enabled": false,
+    "destOverride": ["http","tls","quic","fakedns"]
+  }
+}
 ```
+
+Then restart x-ui: `systemctl restart x-ui`.
 
 Verify:
 ```bash

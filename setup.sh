@@ -15,7 +15,7 @@
 #   8. Print the final VLESS URI
 #
 # Dependencies (auto-installed if missing):
-#   aws cli v2, curl, jq, unzip
+#   aws cli v2, curl, jq, openssl, unzip
 #
 # Usage:
 #   cp .env.example .env   # fill in values
@@ -68,7 +68,7 @@ VLESS_UUID="${VLESS_UUID:-}"
 header "Checking dependencies"
 
 MISSING_APT=()
-for cmd in curl jq; do
+for cmd in curl jq openssl; do
   command -v "$cmd" &>/dev/null && ok "$cmd found" || MISSING_APT+=("$cmd")
 done
 
@@ -343,16 +343,38 @@ fi
 # ─── Step 6: install 3x-ui + acme.sh + issue cert ────────────────────────────
 header "Step 6 — 3x-ui, acme.sh, TLS cert"
 
-# Install 3x-ui if not present
+# Install 3x-ui if not present and capture its random credentials
 if command -v x-ui &>/dev/null; then
   ok "3x-ui already installed"
 else
   info "Installing 3x-ui..."
-  bash -c "$(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh)" < /dev/null
-  ok "3x-ui installed"
+  INSTALL_LOG=$(bash -c "$(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh)" < /dev/null 2>&1)
+  echo "$INSTALL_LOG"
+  XUI_PORT=$(echo "$INSTALL_LOG" | grep -oP 'Port:\s*\K\d+')
+  XUI_BASEPATH=$(echo "$INSTALL_LOG" | grep -oP 'WebBasePath:\s*\K\S+')
+  XUI_API_TOKEN=$(echo "$INSTALL_LOG" | grep -oP 'API Token:\s*\K\S+')
+  ok "3x-ui installed (panel port: ${XUI_PORT})"
 fi
 
 systemctl enable --now x-ui
+
+# Read panel config from DB if not captured from install (re-run scenario)
+command -v sqlite3 &>/dev/null || apt install -y sqlite3 &>/dev/null
+if [[ -f /etc/x-ui/x-ui.db ]]; then
+  XUI_PORT="${XUI_PORT:-$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null)}"
+  XUI_BASEPATH="${XUI_BASEPATH:-$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webBasePath'" 2>/dev/null)}"
+fi
+
+XUI_PORT="${XUI_PORT:-2053}"
+XUI_BASEPATH="${XUI_BASEPATH:-}"
+# Use https if the panel has TLS certs configured, otherwise http
+XUI_CERT=$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webCertFile'" 2>/dev/null || true)
+if [[ -n "$XUI_CERT" && -f "$XUI_CERT" ]]; then
+  PANEL_SCHEME="https"
+else
+  PANEL_SCHEME="http"
+fi
+PANEL_URL="${PANEL_SCHEME}://localhost:${XUI_PORT}${XUI_BASEPATH%/}"
 
 # Install acme.sh if not present
 if [[ -f ~/.acme.sh/acme.sh ]]; then
@@ -366,15 +388,20 @@ fi
 mkdir -p "${CERT_DIR}"
 
 # Check if existing cert covers both domains
+# openssl prints all SANs on one line, so grep -c would return 1 even if both are present.
+# Instead check for each domain separately.
 SKIP_CERT=no
 if [[ -f "${CERT_DIR}/fullchain.pem" ]]; then
-  CERT_COVERS=$(openssl x509 -noout -text -in "${CERT_DIR}/fullchain.pem" 2>/dev/null \
-    | grep -c "DNS:${ROOT_DOMAIN}\|DNS:${CDN_DOMAIN}" || echo 0)
-  if [[ "$CERT_COVERS" -ge 2 ]]; then
-    ok "Cert already exists and covers both ${ROOT_DOMAIN} and ${CDN_DOMAIN} — skipping issuance"
+  CERT_TEXT=$(openssl x509 -noout -text -in "${CERT_DIR}/fullchain.pem" 2>/dev/null)
+  CERT_EXPIRY=$(openssl x509 -noout -enddate -in "${CERT_DIR}/fullchain.pem" 2>/dev/null \
+    | cut -d= -f2)
+  HAS_ROOT=$(echo "$CERT_TEXT" | grep -c "DNS:${ROOT_DOMAIN}" || true)
+  HAS_CDN=$(echo  "$CERT_TEXT" | grep -c "DNS:${CDN_DOMAIN}"  || true)
+  if [[ "$HAS_ROOT" -ge 1 && "$HAS_CDN" -ge 1 ]]; then
+    ok "Cert already covers both ${ROOT_DOMAIN} and ${CDN_DOMAIN} (expires: ${CERT_EXPIRY}) — skipping issuance"
     SKIP_CERT=yes
   else
-    warn "Cert exists but does not cover both domains — re-issuing"
+    warn "Cert exists but does not cover both domains (root=${HAS_ROOT} cdn=${HAS_CDN}) — re-issuing"
   fi
 fi
 
@@ -389,8 +416,28 @@ if [[ "$SKIP_CERT" == "no" ]]; then
   ok "TLS cert issued and saved to ${CERT_DIR}"
 fi
 
-# ─── Step 7: upsert VLESS/WS/TLS inbound in x-ui via SQLite ─────────────────
+# ─── Step 7: upsert VLESS/WS/TLS inbound via 3x-ui REST API ────────────────
 header "Step 7 — x-ui inbound (VLESS/WS/TLS)"
+
+# Ensure API token exists in the api_tokens table (3x-ui stores tokens there, not in settings).
+# If none exists, insert one — x-ui reads api_tokens at runtime so no restart needed.
+XUI_API_TOKEN=$(sqlite3 /etc/x-ui/x-ui.db \
+  "SELECT token FROM api_tokens WHERE enabled=1 ORDER BY id LIMIT 1" 2>/dev/null || true)
+if [[ -z "$XUI_API_TOKEN" ]]; then
+  XUI_API_TOKEN=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 48)
+  info "No API token found — inserting one into api_tokens table..."
+  sqlite3 /etc/x-ui/x-ui.db \
+    "INSERT INTO api_tokens (name, token, enabled, created_at) VALUES ('setup-script', '${XUI_API_TOKEN}', 1, $(date +%s%3N));"
+  ok "API token created"
+else
+  ok "API token loaded from api_tokens table"
+fi
+
+# Bearer token auth + X-Requested-With (required by x-ui's auth middleware)
+XUI_API_HDR=(-sk \
+  -H "Authorization: Bearer ${XUI_API_TOKEN}" \
+  -H "X-Requested-With: XMLHttpRequest" \
+  -H "Content-Type: application/json")
 
 # Generate UUID using xray binary bundled with x-ui
 if [[ -z "$VLESS_UUID" ]]; then
@@ -402,75 +449,83 @@ if [[ -z "$VLESS_UUID" ]]; then
   info "Generated UUID: ${VLESS_UUID}"
 fi
 
-X_UI_DB="/etc/x-ui/x-ui.db"
-NOW_MS=$(date +%s)000
-
-INBOUND_SETTINGS=$(cat <<EOF
-{"clients":[{"comment":"","created_at":${NOW_MS},"email":"user","enable":true,"expiryTime":0,"flow":"","id":"${VLESS_UUID}","limitIp":0,"reset":0,"subId":"","tgId":0,"totalGB":0,"updated_at":${NOW_MS}}],"decryption":"none","encryption":"none"}
+# Build inbound payload
+INBOUND_PAYLOAD=$(cat <<EOF
+{
+  "enable": true,
+  "remark": "${X_UI_REMARK}",
+  "port": ${INBOUND_PORT},
+  "protocol": "vless",
+  "settings": {
+    "clients": [{
+      "id": "${VLESS_UUID}",
+      "email": "user",
+      "enable": true,
+      "flow": "",
+      "limitIp": 0,
+      "totalGB": 0,
+      "expiryTime": 0
+    }],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "ws",
+    "security": "tls",
+    "tlsSettings": {
+      "serverName": "${CDN_DOMAIN}",
+      "alpn": ["http/1.1"],
+      "minVersion": "1.2",
+      "maxVersion": "1.3",
+      "certificates": [{
+        "certificateFile": "${CERT_DIR}/fullchain.pem",
+        "keyFile": "${CERT_DIR}/privkey.pem"
+      }]
+    },
+    "wsSettings": {
+      "path": "${WS_PATH}",
+      "headers": {}
+    }
+  },
+  "sniffing": {
+    "enabled": false,
+    "destOverride": ["http","tls","quic","fakedns"]
+  }
+}
 EOF
 )
 
-# stream_settings — exact schema verified from live inbound 7:
-# - serverName = CDN_DOMAIN (alias domain, as stored by 3x-ui)
-# - alpn = ["http/1.1"] only (required for WebSocket through CloudFront)
-# - fingerprint = "random"
-# - echServerKeys / echForceQuery / echConfigList present but empty
-# - wsSettings.host = "" (empty — CloudFront handles routing via its own Host header)
-STREAM_SETTINGS=$(cat <<EOF
-{"network":"ws","security":"tls","externalProxy":[],"tlsSettings":{"serverName":"${CDN_DOMAIN}","minVersion":"1.2","maxVersion":"1.3","cipherSuites":"","rejectUnknownSni":false,"disableSystemRoot":false,"enableSessionResumption":false,"certificates":[{"certificateFile":"${CERT_DIR}/fullchain.pem","keyFile":"${CERT_DIR}/privkey.pem","oneTimeLoading":false,"usage":"encipherment","buildChain":false}],"alpn":["http/1.1"],"echServerKeys":"","echForceQuery":"none","settings":{"fingerprint":"random","echConfigList":""}},"wsSettings":{"acceptProxyProtocol":false,"path":"${WS_PATH}","host":"","headers":{},"heartbeatPeriod":0}}
-EOF
-)
+# Check if inbound already exists
+info "Checking for existing inbound '${X_UI_REMARK}'..."
+LIST_RESP=$(curl "${XUI_API_HDR[@]}" "${PANEL_URL}/panel/api/inbounds/list" 2>/dev/null)
+if [[ -z "$LIST_RESP" ]]; then
+  die "No response from x-ui panel at ${PANEL_URL} — is x-ui running? Check: systemctl status x-ui"
+fi
+if ! echo "$LIST_RESP" | jq -e '.success' >/dev/null 2>&1; then
+  die "x-ui API error on list: ${LIST_RESP}"
+fi
+EXISTING_ID=$(echo "$LIST_RESP" | jq -r --arg remark "${X_UI_REMARK}" '.obj[] | select(.remark == $remark) | .id // empty' 2>/dev/null || true)
 
-# sniffing disabled — matches live inbound 7
-SNIFFING_SETTINGS='{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
-
-esc() { printf '%s' "$1" | sed "s/'/''/g"; }
-SETTINGS_ESC=$(esc "$INBOUND_SETTINGS")
-STREAM_ESC=$(esc "$STREAM_SETTINGS")
-SNIFFING_ESC=$(esc "$SNIFFING_SETTINGS")
-
-# Table schema verified via: sqlite3 /etc/x-ui/x-ui.db "PRAGMA table_info(inbounds);"
-# Columns: id, user_id, up, down, total, all_time, remark, enable, expiry_time,
-#          traffic_reset, last_traffic_reset_time, listen, port, protocol,
-#          settings, stream_settings, tag, sniffing
-# Note: no 'allocate' column in this version of 3x-ui
-
-INBOUND_EXISTS=$(sqlite3 "${X_UI_DB}" \
-  "SELECT id FROM inbounds WHERE remark='${X_UI_REMARK}' LIMIT 1;" 2>/dev/null || true)
-INBOUND_EXISTS="${INBOUND_EXISTS// /}"
-
-if [[ -n "$INBOUND_EXISTS" ]]; then
-  info "Inbound '${X_UI_REMARK}' already exists (id=${INBOUND_EXISTS}) — updating..."
-  sqlite3 "${X_UI_DB}" \
-    "UPDATE inbounds SET
-       port=${INBOUND_PORT},
-       protocol='vless',
-       settings='${SETTINGS_ESC}',
-       stream_settings='${STREAM_ESC}',
-       sniffing='${SNIFFING_ESC}',
-       enable=1
-     WHERE remark='${X_UI_REMARK}';"
-  ok "Inbound updated"
+if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
+  info "Inbound '${X_UI_REMARK}' already exists (id=${EXISTING_ID}) — updating..."
+  UPDATE_RESP=$(curl "${XUI_API_HDR[@]}" -X POST "${PANEL_URL}/panel/api/inbounds/update/${EXISTING_ID}" \
+    -d "$INBOUND_PAYLOAD" 2>/dev/null)
+  if echo "$UPDATE_RESP" | jq -e '.success' >/dev/null 2>&1; then
+    ok "Inbound updated"
+  else
+    die "Failed to update inbound: $(echo "$UPDATE_RESP" | jq -c '.msg')"
+  fi
 else
   info "Creating new inbound '${X_UI_REMARK}'..."
-  sqlite3 "${X_UI_DB}" \
-    "INSERT INTO inbounds
-       (user_id, up, down, total, all_time, remark, enable, expiry_time,
-        traffic_reset, last_traffic_reset_time, listen, port, protocol,
-        settings, stream_settings, tag, sniffing)
-     VALUES (
-       1, 0, 0, 0, 0,
-       '${X_UI_REMARK}', 1, 0,
-       'never', 0,
-       '0.0.0.0', ${INBOUND_PORT}, 'vless',
-       '${SETTINGS_ESC}',
-       '${STREAM_ESC}',
-       'inbound-${INBOUND_PORT}',
-       '${SNIFFING_ESC}'
-     );"
-  ok "Inbound created"
+  CREATE_RESP=$(curl "${XUI_API_HDR[@]}" -X POST "${PANEL_URL}/panel/api/inbounds/add" \
+    -d "$INBOUND_PAYLOAD" 2>/dev/null)
+  if echo "$CREATE_RESP" | jq -e '.success' >/dev/null 2>&1; then
+    ok "Inbound created"
+  else
+    die "Failed to create inbound: $(echo "$CREATE_RESP" | jq -c '.msg')"
+  fi
 fi
 
+# 4. Restart x-ui
 info "Restarting x-ui to apply inbound..."
 systemctl restart x-ui
 sleep 3
@@ -479,7 +534,7 @@ systemctl is-active x-ui >/dev/null \
   || die "x-ui failed to start — check: journalctl -u x-ui -n 50"
 ok "x-ui is running"
 
-# Probe WebSocket endpoint locally
+# 5. Probe WebSocket endpoint locally
 info "Probing WebSocket endpoint (localhost)..."
 WS_PROBE=$(curl -sk --http1.1 \
   -o /dev/null -w '%{http_code}' \
