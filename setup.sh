@@ -1,21 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup.sh — CloudFront SNI-alias bypass setup
-#
 # Run this script directly on the VPS.
-#
-# Automates:
-#   1. Detect public IP of this machine; ask user to confirm
-#   2. Cloudflare DNS records (root A + cdn CNAME stub)
-#   3. ACM certificate request + DNS validation (us-east-1)
-#   4. CloudFront distribution creation
-#   5. Cloudflare DNS CNAME updated to point to the distribution
-#   6. Install 3x-ui if absent, install acme.sh + issue cert
-#   7. Upsert the VLESS/WS/TLS inbound in x-ui via SQLite
-#   8. Print the final VLESS URI
-#
-# Dependencies (auto-installed if missing):
-#   aws cli v2, curl, jq, openssl, unzip
 #
 # Usage:
 #   cp .env.example .env   # fill in values
@@ -50,19 +35,14 @@ set -o allexport; source "$ENV_FILE"; set +o allexport
 : "${CF_ZONE_ID:?CF_ZONE_ID is required (Cloudflare zone ID)}"
 : "${ROOT_DOMAIN:?ROOT_DOMAIN is required (e.g. yourdomain.com)}"
 : "${CDN_SUBDOMAIN:?CDN_SUBDOMAIN is required (e.g. cdn — results in cdn.yourdomain.com)}"
-: "${WS_PATH:=${WS_PATH:-/api/v1/chat}}"
+: "${WS_PATH:=${WS_PATH:-/videos/watch}}"
 : "${INBOUND_PORT:=${INBOUND_PORT:-443}}"
 : "${X_UI_REMARK:=${X_UI_REMARK:-vless-ws-tls-cf}}"
 
-# Cert dir is always fixed — Let's Encrypt certs issued by acme.sh go here.
-# CloudFront validates the origin cert (OriginProtocolPolicy: https-only), so it must be
-# a publicly trusted cert (Let's Encrypt). Self-signed certs will be rejected by CloudFront.
+# CloudFront validates the origin cert (OriginProtocolPolicy: https-only),
 CERT_DIR="/root/cert/domain"
 
 CDN_DOMAIN="${CDN_SUBDOMAIN}.${ROOT_DOMAIN}"
-
-# optional — leave blank to auto-generate
-VLESS_UUID="${VLESS_UUID:-}"
 
 # ─── dependency checks ────────────────────────────────────────────────────────
 header "Checking dependencies"
@@ -80,25 +60,51 @@ fi
 
 command -v unzip &>/dev/null || { info "unzip not found — installing"; apt install -y unzip; }
 
-if command -v aws &>/dev/null; then
-  ok "aws found"
+# Locate aws on PATH
+AWS_PATH=$(command -v aws 2>/dev/null || true)
+if [[ -z "$AWS_PATH" && -x /usr/local/bin/aws ]]; then
+  AWS_PATH=/usr/local/bin/aws
+fi
+if [[ -z "$AWS_PATH" ]]; then
+  AWS_PATH=$(find /usr/local/aws-cli -name aws -type f 2>/dev/null | head -1 || true)
+fi
+
+if [[ -n "$AWS_PATH" ]]; then
+  export PATH="$(dirname "$AWS_PATH"):$PATH"
+  ok "aws found (${AWS_PATH})"
 else
   info "AWS CLI not found — downloading and installing..."
   curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
   unzip -q /tmp/awscliv2.zip -d /tmp/ || die "Failed to unzip AWS CLI"
-  /tmp/aws/install --update || die "AWS CLI install failed"
+  /tmp/aws/install || die "AWS CLI install failed"
   rm -rf /tmp/aws /tmp/awscliv2.zip
-  ok "AWS CLI installed"
+
+  # Locate the newly installed binary.
+  AWS_PATH=$(command -v aws 2>/dev/null || true)
+  [[ -z "$AWS_PATH" && -x /usr/local/bin/aws ]] && AWS_PATH=/usr/local/bin/aws
+  [[ -z "$AWS_PATH" ]] && \
+    AWS_PATH=$(find /usr/local/aws-cli -name aws -type f 2>/dev/null | head -1 || true)
+  [[ -n "$AWS_PATH" ]] || die "aws binary not found after installation — check /usr/local/aws-cli/"
+  export PATH="$(dirname "$AWS_PATH"):$PATH"
+  ok "AWS CLI installed (${AWS_PATH})"
 fi
 
-AWS_IDENTITY=$(aws sts get-caller-identity 2>/dev/null) \
-  || die "AWS credentials not configured — run 'aws configure'"
+if ! AWS_IDENTITY=$(aws sts get-caller-identity 2>/dev/null); then
+  info "AWS credentials not configured — starting login..."
+  echo ""
+  echo -e "  ${BOLD}aws login --remote${RESET} will print a URL and a one-time code."
+  echo -e "  Open that URL on any device (laptop, phone), sign in to the AWS console,"
+  echo -e "  and enter the code when prompted. The script will continue automatically."
+  echo ""
+  aws login --remote || die "AWS login failed"
+  AWS_IDENTITY=$(aws sts get-caller-identity 2>/dev/null) \
+    || die "AWS credentials still not valid after login"
+fi
 ok "AWS identity: $(echo "$AWS_IDENTITY" | jq -r '.Arn')"
 
-# ─── Step 1: detect and confirm public IP ────────────────────────────────────
+#detect and confirm public IP
 header "Step 1 — Detect public IP"
 
-# Try several sources in order
 VPS_IP=""
 for url in \
   "https://checkip.amazonaws.com" \
@@ -123,7 +129,7 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
 fi
 ok "Using VPS IP: ${VPS_IP}"
 
-# ─── Step 2: Cloudflare DNS — root A record ───────────────────────────────────
+# Cloudflare DNS — root A record
 header "Step 2 — Cloudflare DNS: root A record"
 
 CF_API="https://api.cloudflare.com/client/v4"
@@ -146,7 +152,7 @@ else
   ok "Created A record: ${ROOT_DOMAIN} → ${VPS_IP} (not proxied)"
 fi
 
-# ─── Step 3: ACM certificate (us-east-1) ─────────────────────────────────────
+#ACM certificate (us-east-1)
 header "Step 3 — ACM certificate (us-east-1)"
 
 EXISTING_CERT_ARN=$(aws acm list-certificates \
@@ -171,7 +177,7 @@ else
   ok "Requested ACM cert: ${ACM_CERT_ARN}"
 fi
 
-# Wait for ACM to populate the DNS validation record
+# Wait for ACM to populate
 info "Waiting for ACM to provide DNS validation record..."
 VAL_NAME=""; VAL_VALUE=""
 for i in $(seq 1 20); do
@@ -225,18 +231,46 @@ echo ""
 }
 ok "ACM certificate issued: ${ACM_CERT_ARN}"
 
-# ─── Step 4: CloudFront distribution ─────────────────────────────────────────
+#CloudFront distribution
 header "Step 4 — CloudFront distribution"
 
+# Check if a distribution in this account already owns the alias.
 EXISTING_DIST=$(aws cloudfront list-distributions \
-  --query "DistributionList.Items[?Aliases.Items[?contains(@,'${CDN_DOMAIN}')]].{Id:Id,Domain:DomainName}" \
-  --output json 2>/dev/null | jq -r '.[0] // empty')
+  --output json 2>/dev/null \
+  | jq -c --arg d "${CDN_DOMAIN}" \
+    '[ .DistributionList.Items[]
+       | select((.Aliases.Items // []) | map(. == $d) | any)
+       | {Id: .Id, Domain: .DomainName}
+     ] | .[0] // empty')
 
 if [[ -n "$EXISTING_DIST" && "$EXISTING_DIST" != "null" ]]; then
   CF_DIST_ID=$(echo "$EXISTING_DIST" | jq -r '.Id')
   CF_DIST_DOMAIN=$(echo "$EXISTING_DIST" | jq -r '.Domain')
   ok "Found existing CloudFront distribution: ${CF_DIST_ID} → ${CF_DIST_DOMAIN}"
 else
+  # If a stale Cloudflare CNAME still points to a CloudFront domain (e.g. from a
+  # previous failed run or a deleted distribution), AWS will reject creation with
+  # CNAMEAlreadyExists. Delete it and wait for DNS caches to clear before proceeding.
+  STALE_RECORD=$(curl -s "${CF_API}/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${CDN_DOMAIN}" \
+    "${CF_HDR[@]}" | jq -r '.result[0] | "\(.id // "")|\(.content // "")"')
+  STALE_CDN_ID="${STALE_RECORD%%|*}"
+  STALE_TARGET="${STALE_RECORD##*|}"
+  if [[ -n "$STALE_CDN_ID" && "$STALE_TARGET" == *.cloudfront.net ]]; then
+    curl -s -X DELETE "${CF_API}/zones/${CF_ZONE_ID}/dns_records/${STALE_CDN_ID}" \
+      "${CF_HDR[@]}" >/dev/null
+    info "Deleted stale CNAME ${CDN_DOMAIN} → ${STALE_TARGET} — waiting for DNS cache to clear..."
+    for i in $(seq 1 24); do
+      sleep 5
+      CURRENT=$(dig +short "${CDN_DOMAIN}" CNAME 2>/dev/null | head -1 || true)
+      if [[ -z "$CURRENT" || "$CURRENT" != *.cloudfront.net* ]]; then
+        ok "DNS cache cleared for ${CDN_DOMAIN}"
+        break
+      fi
+      printf "  [%d/24] still resolves to %s — waiting...\r" "$i" "$CURRENT"
+    done
+    echo ""
+  fi
+
   info "Creating CloudFront distribution..."
 
   # Managed policy IDs (stable AWS-published values, confirmed against live distribution)
@@ -302,15 +336,26 @@ else
     "SSLSupportMethod": "sni-only",
     "MinimumProtocolVersion": "TLSv1.2_2021"
   },
-  "PriceClass": "PriceClass_All"
+  "PriceClass": "PriceClass_100"
 }
 EOF
 )
 
-  CREATE_RESULT=$(aws cloudfront create-distribution \
-    --distribution-config "$DIST_CONFIG" \
-    --query '{Id:Distribution.Id,Domain:Distribution.DomainName,Status:Distribution.Status}' \
-    --output json)
+  CREATE_RESULT=""
+  for attempt in 1 2 3; do
+    CREATE_RESULT=$(aws cloudfront create-distribution \
+      --distribution-config "$DIST_CONFIG" \
+      --query '{Id:Distribution.Id,Domain:Distribution.DomainName,Status:Distribution.Status}' \
+      --output json 2>&1) && break
+    if echo "$CREATE_RESULT" | grep -q "CNAMEAlreadyExists"; then
+      warn "CNAMEAlreadyExists on attempt ${attempt}/3 — waiting 30s for CloudFront DNS cache to clear..."
+      sleep 30
+    else
+      die "CloudFront distribution creation failed: ${CREATE_RESULT}"
+    fi
+  done
+  echo "$CREATE_RESULT" | jq -e '.Id' >/dev/null 2>&1 \
+    || die "CloudFront distribution creation failed after retries: ${CREATE_RESULT}"
 
   CF_DIST_ID=$(echo "$CREATE_RESULT" | jq -r '.Id')
   CF_DIST_DOMAIN=$(echo "$CREATE_RESULT" | jq -r '.Domain')
@@ -320,7 +365,7 @@ EOF
   ok "  Status: ${CF_DIST_STATUS} (may take 5-15 min to deploy)"
 fi
 
-# ─── Step 5: Cloudflare CNAME cdn → CloudFront ───────────────────────────────
+# Cloudflare CNAME cdn → CloudFront
 header "Step 5 — Cloudflare CNAME: ${CDN_DOMAIN} → ${CF_DIST_DOMAIN}"
 
 EXISTING_CDN=$(curl -s "${CF_API}/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${CDN_DOMAIN}" \
@@ -340,10 +385,9 @@ else
   ok "Created CNAME: ${CDN_DOMAIN} → ${CF_DIST_DOMAIN}"
 fi
 
-# ─── Step 6: install 3x-ui + acme.sh + issue cert ────────────────────────────
+#install 3x-ui + acme.sh + issue cert
 header "Step 6 — 3x-ui, acme.sh, TLS cert"
 
-# Install 3x-ui if not present and capture its random credentials
 if command -v x-ui &>/dev/null; then
   ok "3x-ui already installed"
 else
@@ -358,7 +402,7 @@ fi
 
 systemctl enable --now x-ui
 
-# Read panel config from DB if not captured from install (re-run scenario)
+# Read panel config from DB if not captured from install
 command -v sqlite3 &>/dev/null || apt install -y sqlite3 &>/dev/null
 if [[ -f /etc/x-ui/x-ui.db ]]; then
   XUI_PORT="${XUI_PORT:-$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null)}"
@@ -374,7 +418,12 @@ if [[ -n "$XUI_CERT" && -f "$XUI_CERT" ]]; then
 else
   PANEL_SCHEME="http"
 fi
-PANEL_URL="${PANEL_SCHEME}://localhost:${XUI_PORT}${XUI_BASEPATH%/}"
+
+if [[ -n "$XUI_BASEPATH" ]]; then
+  XUI_BASEPATH="/${XUI_BASEPATH#/}"
+  XUI_BASEPATH="${XUI_BASEPATH%/}"
+fi
+PANEL_URL="${PANEL_SCHEME}://localhost:${XUI_PORT}${XUI_BASEPATH}"
 
 # Install acme.sh if not present
 if [[ -f ~/.acme.sh/acme.sh ]]; then
@@ -388,8 +437,6 @@ fi
 mkdir -p "${CERT_DIR}"
 
 # Check if existing cert covers both domains
-# openssl prints all SANs on one line, so grep -c would return 1 even if both are present.
-# Instead check for each domain separately.
 SKIP_CERT=no
 if [[ -f "${CERT_DIR}/fullchain.pem" ]]; then
   CERT_TEXT=$(openssl x509 -noout -text -in "${CERT_DIR}/fullchain.pem" 2>/dev/null)
@@ -416,7 +463,7 @@ if [[ "$SKIP_CERT" == "no" ]]; then
   ok "TLS cert issued and saved to ${CERT_DIR}"
 fi
 
-# ─── Step 7: upsert VLESS/WS/TLS inbound via 3x-ui REST API ────────────────
+# upsert VLESS/WS/TLS inbound via 3x-ui REST API
 header "Step 7 — x-ui inbound (VLESS/WS/TLS)"
 
 # Ensure API token exists in the api_tokens table (3x-ui stores tokens there, not in settings).
@@ -440,75 +487,116 @@ XUI_API_HDR=(-sk \
   -H "Content-Type: application/json")
 
 # Generate UUID using xray binary bundled with x-ui
-if [[ -z "$VLESS_UUID" ]]; then
-  VLESS_UUID=$(/usr/local/x-ui/bin/xray uuid 2>/dev/null \
-    || /usr/local/bin/xray uuid 2>/dev/null \
-    || cat /proc/sys/kernel/random/uuid)
-  VLESS_UUID="${VLESS_UUID// /}"
-  [[ -n "$VLESS_UUID" ]] || die "Could not generate a UUID — set VLESS_UUID in .env"
-  info "Generated UUID: ${VLESS_UUID}"
-fi
+VLESS_UUID=$(/usr/local/x-ui/bin/xray uuid 2>/dev/null \
+  || /usr/local/bin/xray uuid 2>/dev/null \
+  || cat /proc/sys/kernel/random/uuid)
+VLESS_UUID="${VLESS_UUID// /}"
+[[ -n "$VLESS_UUID" ]] || die "Could not generate a UUID"
+info "Generated UUID: ${VLESS_UUID}"
 
-# Build inbound payload
+VLESS_SUB_ID=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 16)
+VLESS_EMAIL=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 8)
+
 INBOUND_PAYLOAD=$(cat <<EOF
 {
   "enable": true,
   "remark": "${X_UI_REMARK}",
   "port": ${INBOUND_PORT},
+  "listen": "0.0.0.0",
   "protocol": "vless",
+  "expiryTime": 0,
+  "total": 0,
   "settings": {
     "clients": [{
       "id": "${VLESS_UUID}",
-      "email": "user",
-      "enable": true,
       "flow": "",
+      "email": "${VLESS_EMAIL}",
+      "enable": true,
       "limitIp": 0,
       "totalGB": 0,
-      "expiryTime": 0
+      "expiryTime": 0,
+      "tgId": 0,
+      "subId": "${VLESS_SUB_ID}",
+      "comment": "",
+      "reset": 0
     }],
-    "decryption": "none"
+    "decryption": "none",
+    "encryption": "none"
   },
   "streamSettings": {
     "network": "ws",
     "security": "tls",
+    "externalProxy": [],
     "tlsSettings": {
       "serverName": "${CDN_DOMAIN}",
-      "alpn": ["http/1.1"],
       "minVersion": "1.2",
       "maxVersion": "1.3",
+      "cipherSuites": "",
+      "rejectUnknownSni": false,
+      "disableSystemRoot": false,
+      "enableSessionResumption": false,
       "certificates": [{
         "certificateFile": "${CERT_DIR}/fullchain.pem",
-        "keyFile": "${CERT_DIR}/privkey.pem"
-      }]
+        "keyFile": "${CERT_DIR}/privkey.pem",
+        "oneTimeLoading": false,
+        "usage": "encipherment",
+        "buildChain": false
+      }],
+      "alpn": ["http/1.1"],
+      "echServerKeys": "",
+      "echForceQuery": "none",
+      "settings": {
+        "fingerprint": "random",
+        "echConfigList": ""
+      }
     },
     "wsSettings": {
+      "acceptProxyProtocol": false,
       "path": "${WS_PATH}",
-      "headers": {}
+      "host": "",
+      "headers": {},
+      "heartbeatPeriod": 0
     }
   },
   "sniffing": {
     "enabled": false,
-    "destOverride": ["http","tls","quic","fakedns"]
+    "destOverride": ["http", "tls", "quic", "fakedns"],
+    "metadataOnly": false,
+    "routeOnly": false
   }
 }
 EOF
 )
 
-# Check if inbound already exists
+# Check if inbound already exists; if so, preserve its existing subId
 info "Checking for existing inbound '${X_UI_REMARK}'..."
-LIST_RESP=$(curl "${XUI_API_HDR[@]}" "${PANEL_URL}/panel/api/inbounds/list" 2>/dev/null)
+LIST_RESP=$(curl "${XUI_API_HDR[@]}" "${PANEL_URL}/panel/api/inbounds/list" 2>/dev/null) || true
 if [[ -z "$LIST_RESP" ]]; then
   die "No response from x-ui panel at ${PANEL_URL} — is x-ui running? Check: systemctl status x-ui"
 fi
 if ! echo "$LIST_RESP" | jq -e '.success' >/dev/null 2>&1; then
   die "x-ui API error on list: ${LIST_RESP}"
 fi
-EXISTING_ID=$(echo "$LIST_RESP" | jq -r --arg remark "${X_UI_REMARK}" '.obj[] | select(.remark == $remark) | .id // empty' 2>/dev/null || true)
+EXISTING_ID=$(echo "$LIST_RESP" | jq -r --arg r "${X_UI_REMARK}" '.obj[] | select(.remark == $r) | .id // empty' 2>/dev/null || true)
+
+# If updating, reuse the existing subId and email so the subscription URL doesn't change
+if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
+  EXISTING_SUB_ID=$(echo "$LIST_RESP" | jq -r --arg r "${X_UI_REMARK}" \
+    '.obj[] | select(.remark == $r) | .settings | fromjson? // . | .clients[0].subId // empty' 2>/dev/null || true)
+  EXISTING_EMAIL=$(echo "$LIST_RESP" | jq -r --arg r "${X_UI_REMARK}" \
+    '.obj[] | select(.remark == $r) | .settings | fromjson? // . | .clients[0].email // empty' 2>/dev/null || true)
+  if [[ -n "$EXISTING_SUB_ID" ]]; then
+    INBOUND_PAYLOAD=$(echo "$INBOUND_PAYLOAD" | jq --arg s "$EXISTING_SUB_ID" '.settings.clients[0].subId = $s')
+  fi
+  if [[ -n "$EXISTING_EMAIL" ]]; then
+    INBOUND_PAYLOAD=$(echo "$INBOUND_PAYLOAD" | jq --arg e "$EXISTING_EMAIL" '.settings.clients[0].email = $e')
+  fi
+fi
 
 if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
   info "Inbound '${X_UI_REMARK}' already exists (id=${EXISTING_ID}) — updating..."
   UPDATE_RESP=$(curl "${XUI_API_HDR[@]}" -X POST "${PANEL_URL}/panel/api/inbounds/update/${EXISTING_ID}" \
-    -d "$INBOUND_PAYLOAD" 2>/dev/null)
+    -d "$INBOUND_PAYLOAD" 2>/dev/null) || true
   if echo "$UPDATE_RESP" | jq -e '.success' >/dev/null 2>&1; then
     ok "Inbound updated"
   else
@@ -517,7 +605,7 @@ if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
 else
   info "Creating new inbound '${X_UI_REMARK}'..."
   CREATE_RESP=$(curl "${XUI_API_HDR[@]}" -X POST "${PANEL_URL}/panel/api/inbounds/add" \
-    -d "$INBOUND_PAYLOAD" 2>/dev/null)
+    -d "$INBOUND_PAYLOAD" 2>/dev/null) || true
   if echo "$CREATE_RESP" | jq -e '.success' >/dev/null 2>&1; then
     ok "Inbound created"
   else
@@ -553,7 +641,7 @@ else
   warn "Test externally: curl -vk --http1.1 -H 'Upgrade: websocket' ... https://${ROOT_DOMAIN}${WS_PATH}"
 fi
 
-# ─── Step 8: wait for CloudFront to deploy, resolve PoP IP ───────────────────
+#  wait for CloudFront to deploy, resolve PoP IP
 header "Step 8 — CloudFront deployment status"
 
 CF_STATUS=$(aws cloudfront get-distribution \
@@ -589,30 +677,31 @@ if [[ -z "$CF_POP_IP" ]]; then
   warn "Could not resolve ${CDN_DOMAIN} to an IP yet — using domain as address (also valid)"
 fi
 
-# ─── Step 9: print final VLESS URI ───────────────────────────────────────────
+# print final VLESS URI
 header "Setup Complete"
 
 WS_PATH_ENC=$(printf '%s' "${WS_PATH}" | sed 's|/|%2F|g')
 ALPN_ENC="http%2F1.1"
 
-VLESS_URI="vless://${VLESS_UUID}@${CF_POP_IP}:443?type=ws&path=${WS_PATH_ENC}&security=tls&sni=${CDN_DOMAIN}&host=${CDN_DOMAIN}&alpn=${ALPN_ENC}&fp=random&encryption=none#CloudFront-WS"
+# The connect address is the whitelisted CloudFront PoP IP.
+# The WS Host header tells CloudFront which distribution to route to.
+# allowInsecure=1 is required because the cert is issued for the CDN domain, not the raw IP.
+VLESS_URI="vless://${VLESS_UUID}@${CF_POP_IP}:443?encryption=none&security=tls&sni=${CF_POP_IP}&alpn=${ALPN_ENC}&fp=random&allowInsecure=1&type=ws&host=${CDN_DOMAIN}&path=${WS_PATH_ENC}#${X_UI_REMARK}"
+
+MAGENTA='\033[1;35m'
 
 echo ""
-echo -e "${BOLD}VLESS URI:${RESET}"
-echo "$VLESS_URI"
+echo -e "${BOLD}╔══════════════════════════════════════════════════════════════════╗${RESET}"
+echo -e "${BOLD}║                        VLESS CONFIG URI                         ║${RESET}"
+echo -e "${BOLD}╠══════════════════════════════════════════════════════════════════╣${RESET}"
+echo -e "${BOLD}║${RESET}"
+echo -e "${BOLD}║${RESET}  ${GREEN}${VLESS_URI}${RESET}"
+echo -e "${BOLD}║${RESET}"
+echo -e "${BOLD}╚══════════════════════════════════════════════════════════════════╝${RESET}"
 echo ""
-echo -e "${BOLD}Summary:${RESET}"
-printf "  %-28s %s\n" "VPS IP:"               "$VPS_IP"
-printf "  %-28s %s\n" "Origin domain:"        "$ROOT_DOMAIN"
-printf "  %-28s %s\n" "CDN alias domain:"     "$CDN_DOMAIN"
-printf "  %-28s %s\n" "CloudFront dist ID:"   "$CF_DIST_ID"
-printf "  %-28s %s\n" "CloudFront domain:"    "$CF_DIST_DOMAIN"
-printf "  %-28s %s\n" "CloudFront PoP IP:"    "$CF_POP_IP"
-printf "  %-28s %s\n" "ACM cert ARN:"         "$ACM_CERT_ARN"
-printf "  %-28s %s\n" "VLESS UUID:"           "$VLESS_UUID"
-printf "  %-28s %s\n" "WebSocket path:"       "$WS_PATH"
-printf "  %-28s %s\n" "Inbound port:"         "$INBOUND_PORT"
-printf "  %-28s %s\n" "Cert on VPS:"          "${CERT_DIR}/fullchain.pem"
+echo -e "${MAGENTA}${BOLD}  ⚠  Replace ${CF_POP_IP} in the URI with a whitelisted CloudFront IP${RESET}"
+echo -e "${MAGENTA}${BOLD}     for your region. CloudFront IPs rotate — this is the current one.${RESET}"
+echo -e "${MAGENTA}${BOLD}     Use https://github.com/everythingnew/cloudfront-scanner to find one.${RESET}"
 echo ""
-echo -e "${CYAN}Import the VLESS URI into v2rayN, Hiddify, Nekoray, or any VLESS-compatible client.${RESET}"
+echo -e "${CYAN}Import into v2rayN, Hiddify, Nekoray, or any VLESS-compatible client.${RESET}"
 echo -e "${CYAN}If CloudFront is still deploying, wait 5-15 minutes before connecting.${RESET}"
